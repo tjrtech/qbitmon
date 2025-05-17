@@ -1,0 +1,10 @@
+requests
+imdbpy
+smtplib
+email
+shutil
+difflib
+logging
+os
+re
+time
