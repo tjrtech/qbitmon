@@ -1,14 +1,16 @@
-import requests
+import requests  # type: ignore
 import time
 import os
+import sys
 import shutil
 import difflib
 import logging
 from pathlib import Path
 import re
-from imdb import Cinemagoer
+from imdb import Cinemagoer  # type: ignore
 import smtplib
 from email.message import EmailMessage
+from difflib import SequenceMatcher
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,7 +30,7 @@ ia = Cinemagoer()
 # qBittorrent Configuration
 QB_URL = "http://localhost:8080"
 USERNAME = "admin"
-PASSWORD = "Hansol47$"
+PASSWORD = os.getenv('GQBIT_PASSWORD')
 
 def login(session):
     response = session.post(f"{QB_URL}/api/v2/auth/login", data={
@@ -38,74 +40,93 @@ def login(session):
     return response.text == 'Ok.'
 
 def get_completed_torrents(session):
-    response = session.get(f"{QB_URL}/api/v2/torrents/info", params={"filter": "completed"})
-    return response.json()
+    try:
+        response = session.get(f"{QB_URL}/api/v2/torrents/info", params={"filter": "completed"}, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.ConnectionError as e:
+        logging.error(f"Connection error while accessing qBittorrent API: {e}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Request to qBittorrent API failed: {e}")
+    return []
+
+def normalize(name):
+    name = re.sub(r'\[.*?\]', '', name)
+    return re.sub(r'\s+', ' ', name).strip().lower()
 
 def find_matching_directory(base_path, expected_name):
     full_path = Path(base_path) / expected_name
     if full_path.exists():
+        logging.info(f"Found source directory {expected_name} thus no fuzzy match required")
         return full_path
 
     try:
-        candidates = [d for d in Path(base_path).iterdir() if d.is_dir()]
-        match = difflib.get_close_matches(expected_name, [d.name for d in candidates], n=1)
-        if match:
-            corrected_path = Path(base_path) / match[0]
-            logging.info(f"Corrected directory name: {expected_name} → {match[0]}")
-            return corrected_path
+        expected_norm = normalize(expected_name)
+        best_match = None
+        best_score = 0
+
+        for d in Path(base_path).iterdir():
+            if d.is_dir():
+                candidate_norm = normalize(d.name)
+                score = SequenceMatcher(None, expected_norm, candidate_norm).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_match = d
+
+        if best_score >= 0.8:
+            logging.info(f"Corrected source directory name to match {best_match.name} (score: {best_score:.2f})")
+            return best_match
+        else:
+            logging.warning(f"No close match found for '{expected_name}' (best score: {best_score:.2f})")
     except Exception as e:
         logging.warning(f"Error scanning directories: {e}")
     return None
 
-def move_video_files_from_dir(torrent_name, full_path):
+def move_video_files_from_torrent_dir(torrent_name, full_path):
     moved = False
     for root, _, files in os.walk(full_path):
         for file in files:
             if Path(file).suffix.lower() in VIDEO_EXTENSIONS:
                 src = Path(root) / file
-                dst = Path.cwd() / file
-                logging.info(f"Moving movie {os.path.basename(src)} → {os.path.dirname(dst)}")
-                shutil.move(str(src), str(dst))
-                file_path = rename_movie_file(str(dst))
-                if file_path:
-                    if move_file_to_plex_movies(file_path):
-                        send_sms_via_email(SMS_CELL_NUMBER, CARRIER_GATEWAY,
-                                           f"Imported to Plex server: {os.path.basename(file_path)}",
-                                           SENDER_EMAIL, SENDER_PASSWORD)
-                        moved = True
-                else:
-                    send_sms_via_email(SMS_CELL_NUMBER, CARRIER_GATEWAY,
-                        f"Could NOT rename and import to Plex server: {os.path.basename(src)}",
-                        SENDER_EMAIL, SENDER_PASSWORD)
-                    logging.warning(f"Skipping file due to failed rename: {dst}")
+                renamed_path = rename_movie_file(str(src))
 
-    logging.info(f"Removing directory: {full_path}")
+                if renamed_path:
+                    if move_file_to_plex_movies(renamed_path):
+                        send_email("Imported to Plex", f"{os.path.basename(renamed_path)}",
+                                   SENDER_EMAIL, SENDER_PASSWORD)
+                        moved = True
+                    else:
+                        logging.warning(f"Failed to move renamed file: {renamed_path}")
+                        send_email("Plex Import Failed", f"Could NOT move to Plex: {os.path.basename(renamed_path)}",
+                                   SENDER_EMAIL, SENDER_PASSWORD)
+                else:
+                    logging.warning(f"Failed to rename file: {src}")
+                    send_email("Plex Import Failed", f"Could NOT rename: {os.path.basename(src)}",
+                               SENDER_EMAIL, SENDER_PASSWORD)
+
+    if not moved:
+        logging.info(f"No video files found in {full_path}")
+
+    logging.info(f"Removing directory {full_path}")
     shutil.rmtree(full_path)
     return moved
 
-def remove_torrent(session, torrent_hash):
-    response = session.post(f"{QB_URL}/api/v2/torrents/delete", data={
-        'hashes': torrent_hash,
-        'deleteFiles': 'false'
-    })
-    if response.status_code == 200:
-        logging.info(f"Removed torrent from qBittorrent: {torrent_hash}")
-    else:
-        logging.error(f"Failed to remove torrent {torrent_hash}: {response.text}")
-
 def rename_movie_file(filename):
+    if not os.path.exists(filename):
+        logging.error(f"Source file does not exist: {filename}")
+        return None
+
     name, ext = os.path.splitext(filename)
     if ext.lower() not in VIDEO_EXTENSIONS:
-        logging.info(f"Skipped: {filename} (unsupported extension)")
+        logging.info(f"Skipping {filename} (unsupported extension)")
         return None
 
     final_name_pattern = re.compile(r'.+_\(\d{4}\)' + re.escape(ext) + r'$')
     if final_name_pattern.match(filename):
-        logging.info(f"Skipped: {filename} (already in Title_(Year) format)")
-        new_path = Path(filename).parent / filename
-        return new_path
+        logging.info(f"Skipping {filename} (already in Title_(Year) format)")
+        return filename
 
-    clean_name = name.replace('.', '_').replace(' ', '_')
+    clean_name = os.path.basename(name).replace('.', '_').replace(' ', '_')
     parts = clean_name.split('_')
 
     year = None
@@ -154,11 +175,12 @@ def rename_movie_file(filename):
         new_name = f"{title}{ext}"
 
     new_name = re.sub(r'_+', '_', new_name).strip('_')
-    new_path = Path(filename).parent / new_name
+    parent_dir = os.path.dirname(filename)
+    new_path = os.path.join(parent_dir, new_name)
 
     os.rename(filename, new_path)
-    logging.info(f"Renaming {os.path.basename(filename)} -> {os.path.basename(new_name)}")
-    return str(new_path)
+    logging.info(f"Renaming movie to {os.path.basename(new_name)}")
+    return new_path
 
 def move_file_to_plex_movies(file_path):
     source = Path(file_path).resolve()
@@ -179,40 +201,50 @@ def move_file_to_plex_movies(file_path):
         return False
 
     try:
-        logging.info(f"Moving {os.path.basename(source)} to Plex server...")
-        shutil.copy2(source, destination)
-        os.remove(source)
-        logging.info(f"File moved to {destination}")
+        # Use rename instead of copy+remove for speed on same volume
+        source.rename(destination)
+        logging.info(f"Moved {os.path.basename(source)} to {destination_dir}")
         return True
     except Exception as e:
         logging.error(f"Failed to move file: {e}")
         return False
 
-def send_sms_via_email(phone_number: str, carrier_gateway: str, message: str,
-                       sender_email: str, sender_password: str):
-    sms_email = f"{phone_number}@{carrier_gateway}"
-
+def send_email(subject: str, body: str, sender_email: str, sender_password: str):
+    recipient_email = sender_email  
     msg = EmailMessage()
-    msg.set_content(message)
-    msg["Subject"] = ""
+    msg.set_content(body)
+    msg["Subject"] = subject
     msg["From"] = sender_email
-    msg["To"] = sms_email
+    msg["To"] = sender_email
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(sender_email, sender_password)
             smtp.send_message(msg)
-            logging.info(f"Sent message to {sms_email}")
+            logging.info(f"Email sent to {recipient_email}")
     except Exception as e:
-        logging.error(f"Failed to send SMS via email: {e}")
+        logging.error(f"Failed to send email: {e}")
+
+def remove_torrent(session, torrent_hash):
+    response = session.post(f"{QB_URL}/api/v2/torrents/delete", data={
+        'hashes': torrent_hash,
+        'deleteFiles': 'false'
+    })
+    if response.status_code == 200:
+        logging.info(f"Removed torrent from qBittorrent {torrent_hash}")
+    else:
+        logging.error(f"Failed to remove torrent {torrent_hash}: {response.text}")
 
 def main():
     session = requests.Session()
-    if not login(session):
-        logging.error("Failed to log in to qBittorrent.")
-        return
+    try:
+        if not login(session):
+            logging.error("Failed to log in to qBittorrent. Is qBittorrent running?")
+            sys.exit(1)
+    except requests.exceptions.ConnectionError:
+        logging.error(f"Could not connect to qBittorrent at {QB_URL}. Is qBittorrent running?")
+        sys.exit(1)
 
-    print()
     logging.info("Monitoring for completed downloads... Press Ctrl+C to stop.")
     known_completed_hashes = set()
 
@@ -225,15 +257,15 @@ def main():
                     name = torrent['name']
                     save_path = torrent['save_path']
 
-                    logging.info('-'*100)
-                    logging.info(f"Detected completed torrent: {name}")
+                    logging.info('-' * 100)
+                    logging.info(f"Detected completed torrent {name}")
                     full_path = find_matching_directory(save_path, name)
 
                     if full_path is None:
                         logging.warning(f"Could not find matching directory for: {name}")
                         continue
 
-                    move_video_files_from_dir(name, full_path)
+                    move_video_files_from_torrent_dir(name, full_path)
                     remove_torrent(session, torrent_hash)
                     known_completed_hashes.add(torrent_hash)
 
