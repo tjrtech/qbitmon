@@ -30,7 +30,7 @@ ia = Cinemagoer()
 # qBittorrent Configuration
 QB_URL = "http://localhost:8080"
 USERNAME = "admin"
-PASSWORD = os.getenv('GQBIT_PASSWORD')
+PASSWORD = os.getenv('QBIT_PASSWORD')
 
 def login(session):
     response = session.post(f"{QB_URL}/api/v2/auth/login", data={
